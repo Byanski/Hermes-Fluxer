@@ -25,6 +25,7 @@ const redis = new Redis(REDIS_URL);
 const sc = StringCodec();
 const pendingEdits = new Map<string, NodeJS.Timeout>();
 const processedExecutions = new Set<string>();
+const MAX_INCOMING_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 // Pre-configured Axios client for Fluxer's REST API
 const fluxerClient = axios.create({
@@ -33,6 +34,77 @@ const fluxerClient = axios.create({
         'Authorization': `Bot ${BOT_TOKEN}`
     }
 });
+
+function attachmentUrl(att: any): string | null {
+    return att?.url || att?.proxy_url || att?.download_url || att?.href || null;
+}
+
+function attachmentFilename(att: any, index: number): string {
+    return att?.filename || att?.name || `attachment_${index + 1}`;
+}
+
+async function downloadIncomingAttachments(rawAttachments: any[] = []) {
+    const downloaded = [];
+
+    for (let index = 0; index < rawAttachments.length; index++) {
+        const att = rawAttachments[index];
+        const url = attachmentUrl(att);
+        const filename = attachmentFilename(att, index);
+        const contentType = att?.content_type || att?.contentType || att?.mime_type || att?.mimeType || "application/octet-stream";
+
+        if (!url) {
+            downloaded.push({
+                filename,
+                content_type: contentType,
+                size: att?.size || null,
+                error: "No downloadable URL was provided by Fluxer."
+            });
+            continue;
+        }
+
+        try {
+            const response = url.startsWith("http")
+                ? await axios.get(url, {
+                    responseType: "arraybuffer",
+                    headers: { Authorization: `Bot ${BOT_TOKEN}` },
+                    maxContentLength: MAX_INCOMING_ATTACHMENT_BYTES,
+                    maxBodyLength: MAX_INCOMING_ATTACHMENT_BYTES
+                })
+                : await fluxerClient.get(url, {
+                    responseType: "arraybuffer",
+                    maxContentLength: MAX_INCOMING_ATTACHMENT_BYTES,
+                    maxBodyLength: MAX_INCOMING_ATTACHMENT_BYTES
+                });
+
+            const bytes = Buffer.from(response.data);
+            if (bytes.length > MAX_INCOMING_ATTACHMENT_BYTES) {
+                downloaded.push({
+                    filename,
+                    content_type: contentType,
+                    size: bytes.length,
+                    error: "Attachment exceeded the configured 10MB limit."
+                });
+                continue;
+            }
+
+            downloaded.push({
+                filename,
+                content_type: response.headers?.["content-type"] || contentType,
+                size: bytes.length,
+                data: bytes.toString("base64")
+            });
+        } catch (err: any) {
+            downloaded.push({
+                filename,
+                content_type: contentType,
+                size: att?.size || null,
+                error: err.response?.data?.message || err.message || "Failed to download attachment."
+            });
+        }
+    }
+
+    return downloaded;
+}
 
 // ==========================================
 // CORE INITIALIZATION
@@ -120,7 +192,7 @@ function connectToFluxerGateway(nc: NatsConnection, gatewayUrl: string) {
             }
 
             if ((op === 0 || op === "DISPATCH") && t === "MESSAGE_CREATE") {
-                const { id: messageId, channel_id: channelId, content, author, mentions } = d;
+                const { id: messageId, channel_id: channelId, content, author, mentions, attachments } = d;
 
                 if (author?.bot) return;
 
@@ -142,6 +214,10 @@ function connectToFluxerGateway(nc: NatsConnection, gatewayUrl: string) {
                     }
 
                     const cleanPrompt = content.replace(/<@!?\d+>/g, "").trim();
+                    const incomingAttachments = await downloadIncomingAttachments(attachments || []);
+                    if (incomingAttachments.length > 0) {
+                        console.log(`📎 Forwarding ${incomingAttachments.length} incoming attachment(s) to worker`);
+                    }
 
                     const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                     const workerJob = {
@@ -150,7 +226,8 @@ function connectToFluxerGateway(nc: NatsConnection, gatewayUrl: string) {
                         payload: {
                             user_id: author.id,
                             channel_id: channelId,
-                            prompt: cleanPrompt
+                            prompt: cleanPrompt,
+                            attachments: incomingAttachments
                         }
                     };
 
@@ -190,11 +267,6 @@ async function handleStateChange(data: any) {
     const stateKey = `hermes:execution:${execution_id}`;
     const stateStr = await redis.get(stateKey);
 
-    // SAFETY LOCK: If the state is gone, the job is done. DO NOT process updates.
-    if (!stateStr && !is_final) {
-        console.log(`⚠️ Ignoring late-arriving packet for finished job: ${execution_id}`);
-        return;
-    }
     const state = stateStr ? JSON.parse(stateStr) : {};
 
     // Phase A: Create Placeholder
@@ -211,12 +283,19 @@ async function handleStateChange(data: any) {
         } catch (err: any) {
             console.error("Failed creating placeholder:", err.response?.data || err.message);
         }
-        return;
+
+        if (!state.fluxer_message_id) return;
+
+        // Non-final updates only need the placeholder. Final first-packet updates
+        // should keep flowing so attachments are posted and state is cleaned up.
+        if (!is_final) return;
     }
 
     // Phase B: Debounce Updates
-    if (pendingEdits.has(execution_id) && !is_final) {
+    // THE FIX: ALWAYS clear the previous timer so old updates don't overwrite new ones!
+    if (pendingEdits.has(execution_id)) {
         clearTimeout(pendingEdits.get(execution_id));
+        pendingEdits.delete(execution_id);
     }
 
     const editTask = setTimeout(async () => {
