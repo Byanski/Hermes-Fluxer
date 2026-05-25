@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  nats:
+    image: nats:latest
+    ports:
+      - "4222:4222"
+      - "8222:8222" # Web UI
+
+  valkey:
+    image: valkey/valkey:latest
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: fluxer_agent
+    ports:
+      - "5432:5432"
